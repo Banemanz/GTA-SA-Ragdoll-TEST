@@ -27,6 +27,8 @@ namespace {
     constexpr float kGroundFriction = 0.80f;
     constexpr int   kSolverIterations = 6;
     constexpr float kNodeCollisionRadius = 0.045f;
+    constexpr bool  kDrawDebugSkeleton = true;
+    constexpr bool  kRestorePedMesh = true;
 
     enum RagNodeId {
         NODE_PELVIS,
@@ -61,6 +63,15 @@ namespace {
         float stiffness{};
     };
 
+    struct BendConstraint {
+        unsigned short a{};
+        unsigned short b{};
+        unsigned short c{};
+        float minDist{};
+        float maxDist{};
+        float stiffness{};
+    };
+
     struct BoneSource {
         unsigned short ragNode{};
         unsigned short pedBone{};
@@ -72,6 +83,8 @@ namespace {
         bool active{};
         std::array<Node, NODE_COUNT> nodes{};
         std::vector<Edge> edges;
+        std::vector<BendConstraint> bends;
+        CVector rootOffset{};
         unsigned int lastTouchedFrame{};
     };
 
@@ -105,6 +118,25 @@ namespace {
         return std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
     }
 
+    void AddBend(std::vector<BendConstraint>& bends, RagNodeId a, RagNodeId b, RagNodeId c, float minAngleDeg, float maxAngleDeg, const std::array<Node, NODE_COUNT>& nodes, float stiffness) {
+        const float l1 = Distance(nodes[a].pos, nodes[b].pos);
+        const float l2 = Distance(nodes[c].pos, nodes[b].pos);
+
+        const float minCos = std::cos(maxAngleDeg * 3.14159265f / 180.0f);
+        const float maxCos = std::cos(minAngleDeg * 3.14159265f / 180.0f);
+        const float minDistSq = std::max(0.0001f, l1 * l1 + l2 * l2 - 2.0f * l1 * l2 * maxCos);
+        const float maxDistSq = std::max(0.0001f, l1 * l1 + l2 * l2 - 2.0f * l1 * l2 * minCos);
+
+        bends.push_back({
+            static_cast<unsigned short>(a),
+            static_cast<unsigned short>(b),
+            static_cast<unsigned short>(c),
+            std::sqrt(std::min(minDistSq, maxDistSq)),
+            std::sqrt(std::max(minDistSq, maxDistSq)),
+            stiffness
+            });
+    }
+
     bool IsDeadEnough(const CPed* ped) {
         return ped && (ped->m_fHealth <= 0.0f || ped->m_ePedState == PEDSTATE_DIE || ped->m_ePedState == PEDSTATE_DEAD || ped->m_ePedState == PEDSTATE_DIE_BY_STEALTH);
     }
@@ -112,7 +144,9 @@ namespace {
     void BuildEdgeRig(PedRagdoll& ragdoll) {
         auto& n = ragdoll.nodes;
         auto& e = ragdoll.edges;
+        auto& b = ragdoll.bends;
         e.clear();
+        b.clear();
 
         AddEdge(e, NODE_PELVIS, NODE_SPINE, Distance(n[NODE_PELVIS].pos, n[NODE_SPINE].pos), 0.90f);
         AddEdge(e, NODE_SPINE, NODE_NECK, Distance(n[NODE_SPINE].pos, n[NODE_NECK].pos), 0.90f);
@@ -137,6 +171,12 @@ namespace {
         AddEdge(e, NODE_L_SHOULDER, NODE_R_SHOULDER, Distance(n[NODE_L_SHOULDER].pos, n[NODE_R_SHOULDER].pos), 0.80f);
         AddEdge(e, NODE_L_HIP, NODE_R_HIP, Distance(n[NODE_L_HIP].pos, n[NODE_R_HIP].pos), 0.80f);
         AddEdge(e, NODE_L_HAND, NODE_R_HAND, Distance(n[NODE_L_HAND].pos, n[NODE_R_HAND].pos), 0.25f);
+
+        AddBend(b, NODE_L_SHOULDER, NODE_L_ELBOW, NODE_L_HAND, 12.0f, 165.0f, n, 0.45f);
+        AddBend(b, NODE_R_SHOULDER, NODE_R_ELBOW, NODE_R_HAND, 12.0f, 165.0f, n, 0.45f);
+        AddBend(b, NODE_L_HIP, NODE_L_KNEE, NODE_L_FOOT, 6.0f, 170.0f, n, 0.55f);
+        AddBend(b, NODE_R_HIP, NODE_R_KNEE, NODE_R_FOOT, 6.0f, 170.0f, n, 0.55f);
+        AddBend(b, NODE_PELVIS, NODE_SPINE, NODE_NECK, 8.0f, 160.0f, n, 0.35f);
     }
 
     bool TryCaptureInitialPose(CPed* ped, PedRagdoll& ragdoll) {
@@ -156,6 +196,7 @@ namespace {
         ragdoll.nodes[NODE_PELVIS].invMass = 0.6f;
         ragdoll.nodes[NODE_L_FOOT].invMass = 0.7f;
         ragdoll.nodes[NODE_R_FOOT].invMass = 0.7f;
+        ragdoll.rootOffset = ped->GetPosition() - ragdoll.nodes[NODE_PELVIS].pos;
 
         BuildEdgeRig(ragdoll);
         return true;
@@ -219,9 +260,51 @@ namespace {
                 b.pos -= corr;
             }
 
+            for (const BendConstraint& bend : ragdoll.bends) {
+                Node& a = ragdoll.nodes[bend.a];
+                Node& c = ragdoll.nodes[bend.c];
+
+                CVector delta = c.pos - a.pos;
+                const float lenSq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+                if (lenSq < 0.000001f)
+                    continue;
+
+                const float len = std::sqrt(lenSq);
+                float target = len;
+                if (len < bend.minDist)
+                    target = bend.minDist;
+                else if (len > bend.maxDist)
+                    target = bend.maxDist;
+
+                if (target != len) {
+                    const float corrAmount = (target - len) / len;
+                    const CVector corr = delta * (0.5f * bend.stiffness * corrAmount);
+                    a.pos -= corr;
+                    c.pos += corr;
+                }
+            }
+
             for (Node& n : ragdoll.nodes)
                 SolveGround(n);
         }
+    }
+
+    void SyncPedMeshToRagdoll(PedRagdoll& ragdoll, CPed* ped) {
+        if (!ped)
+            return;
+
+        const CVector rootPos = ragdoll.nodes[NODE_PELVIS].pos + ragdoll.rootOffset;
+        ped->SetPosn(rootPos);
+
+        const CVector facingVec = ragdoll.nodes[NODE_NECK].pos - ragdoll.nodes[NODE_PELVIS].pos;
+        const float len2D = std::sqrt(facingVec.x * facingVec.x + facingVec.y * facingVec.y);
+        if (len2D > 0.0001f) {
+            const float heading = std::atan2(-facingVec.x, facingVec.y);
+            ped->SetHeading(heading);
+        }
+
+        ped->bUpdateAnimHeading = false;
+        ped->bUpdateMatricesRequired = true;
     }
 
     void RenderRagdollLines(const PedRagdoll& ragdoll) {
@@ -293,12 +376,21 @@ namespace {
             const float dt = CTimer::ms_fTimeStep;
             Simulate(ragdoll, dt);
 
-            ped->bDontRender = true;
+            if (kRestorePedMesh) {
+                SyncPedMeshToRagdoll(ragdoll, ped);
+                ped->bDontRender = false;
+            }
+            else {
+                ped->bDontRender = true;
+            }
             return false;
             }), g_ragdolls.end());
     }
 
     void DrawRagdolls() {
+        if (!kDrawDebugSkeleton)
+            return;
+
         RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, reinterpret_cast<void*>(TRUE));
         RwRenderStateSet(rwRENDERSTATEZTESTENABLE, reinterpret_cast<void*>(TRUE));
 
@@ -323,7 +415,7 @@ public:
                 return;
 
             if (PedRagdoll* ragdoll = FindRagdoll(ped)) {
-                if (ragdoll->active)
+                if (ragdoll->active && !kRestorePedMesh)
                     ped->bDontRender = true;
             }
             };
