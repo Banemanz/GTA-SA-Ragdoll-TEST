@@ -28,7 +28,8 @@ namespace {
     constexpr int   kSolverIterations = 6;
     constexpr float kNodeCollisionRadius = 0.045f;
     constexpr bool  kDrawDebugSkeleton = true;
-    constexpr bool  kRestorePedMesh = true;
+    constexpr bool  kRestorePedMesh = false; // Root-only sync, not full bone skinning yet.
+    constexpr bool  kInheritPedVelocityOnSpawn = true;
 
     enum RagNodeId {
         NODE_PELVIS,
@@ -79,16 +80,17 @@ namespace {
 
     struct PedRagdoll {
         CPed* ped{};
-        int pedRef{ -1 };
+        int pedRef{-1};
         bool active{};
         std::array<Node, NODE_COUNT> nodes{};
         std::vector<Edge> edges;
         std::vector<BendConstraint> bends;
         CVector rootOffset{};
+        CVector inheritedVelocity{};
         unsigned int lastTouchedFrame{};
     };
 
-    constexpr std::array<BoneSource, NODE_COUNT> kBoneMap = { {
+    constexpr std::array<BoneSource, NODE_COUNT> kBoneMap = {{
         { NODE_PELVIS, BONE_PELVIS },
         { NODE_SPINE, BONE_SPINE1 },
         { NODE_NECK, BONE_NECK },
@@ -105,7 +107,7 @@ namespace {
         { NODE_R_HIP, BONE_RIGHTHIP },
         { NODE_R_KNEE, BONE_RIGHTKNEE },
         { NODE_R_FOOT, BONE_RIGHTFOOT }
-    } };
+    }};
 
     static std::vector<PedRagdoll> g_ragdolls;
 
@@ -134,7 +136,7 @@ namespace {
             std::sqrt(std::min(minDistSq, maxDistSq)),
             std::sqrt(std::max(minDistSq, maxDistSq)),
             stiffness
-            });
+        });
     }
 
     bool IsDeadEnough(const CPed* ped) {
@@ -198,14 +200,23 @@ namespace {
         ragdoll.nodes[NODE_R_FOOT].invMass = 0.7f;
         ragdoll.rootOffset = ped->GetPosition() - ragdoll.nodes[NODE_PELVIS].pos;
 
+        if (kInheritPedVelocityOnSpawn)
+            ragdoll.inheritedVelocity = ped->m_vecMoveSpeed + ped->m_vecLastCollisionImpactVelocity * 0.08f;
+
         BuildEdgeRig(ragdoll);
+
+        if (kInheritPedVelocityOnSpawn) {
+            for (Node& n : ragdoll.nodes)
+                n.prevPos = n.pos - ragdoll.inheritedVelocity;
+        }
+
         return true;
     }
 
     PedRagdoll* FindRagdoll(CPed* ped) {
         auto it = std::find_if(g_ragdolls.begin(), g_ragdolls.end(), [ped](const PedRagdoll& r) {
             return r.ped == ped;
-            });
+        });
         return it != g_ragdolls.end() ? &*it : nullptr;
     }
 
@@ -305,6 +316,9 @@ namespace {
 
         ped->bUpdateAnimHeading = false;
         ped->bUpdateMatricesRequired = true;
+        ped->bDontRender = false;
+        ped->UpdateRwMatrix();
+        ped->UpdateRpHAnim();
     }
 
     void RenderRagdollLines(const PedRagdoll& ragdoll) {
@@ -357,8 +371,7 @@ namespace {
 
                 if (created.active)
                     g_ragdolls.push_back(created);
-            }
-            else {
+            } else {
                 found->lastTouchedFrame = CTimer::m_FrameCounter;
             }
         }
@@ -379,12 +392,11 @@ namespace {
             if (kRestorePedMesh) {
                 SyncPedMeshToRagdoll(ragdoll, ped);
                 ped->bDontRender = false;
-            }
-            else {
+            } else {
                 ped->bDontRender = true;
             }
             return false;
-            }), g_ragdolls.end());
+        }), g_ragdolls.end());
     }
 
     void DrawRagdolls() {
@@ -404,11 +416,11 @@ public:
     InhouseRagdollPlugin() {
         Events::gameProcessEvent += [] {
             TickRagdolls();
-            };
+        };
 
         Events::drawingEvent += [] {
             DrawRagdolls();
-            };
+        };
 
         Events::pedRenderEvent.after += [](CPed* ped) {
             if (!ped)
@@ -418,6 +430,6 @@ public:
                 if (ragdoll->active && !kRestorePedMesh)
                     ped->bDontRender = true;
             }
-            };
+        };
     }
 } g_inhouseRagdollPlugin;
